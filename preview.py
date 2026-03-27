@@ -14,6 +14,8 @@ from areas import (
     rotate_to_edge,
     compute_contrast,
     viterbi,
+    compute_area,
+    path_to_mask,
     RAW_IMAGES_DIR,
 )
 
@@ -47,7 +49,19 @@ def main():
     r0 = np.clip(r0, 0, polar.shape[1] - 1)
     edge_path = viterbi(contrast, r0, radius_step)
 
-    fig, (ax_img, ax_polar, ax_contrast) = plt.subplots(1, 3, figsize=(18, 5))
+    area = compute_area(edge_path, radius_step, angle_step)
+    mask = path_to_mask(
+        blurred.shape, ann["center_x"], ann["center_y"],
+        ann["edge_x"], ann["edge_y"], edge_path, radius_step, angle_step,
+    )
+
+    # Build RGB overlay: normalize image to [0,1], tint masked region cyan
+    img_norm = (blurred - blurred.min()) / (blurred.max() - blurred.min())
+    img_rgb  = np.stack([img_norm] * 3, axis=-1)
+    tint     = np.array([0.0, 0.6, 0.6])   # cyan
+    img_rgb[mask] = img_rgb[mask] * 0.65 + tint * 0.35
+
+    fig, (ax_img, ax_polar, ax_contrast, ax_mask) = plt.subplots(1, 4, figsize=(24, 5))
 
     ax_img.imshow(blurred, cmap="gray")
     ax_img.plot(ann["center_x"], ann["center_y"], "r+", markersize=12, markeredgewidth=2)
@@ -76,6 +90,10 @@ def main():
     ax_contrast.axhline(y=r_annotated / radius_step, color="red", linestyle="--", linewidth=1)
     ax_contrast.plot(angle_indices, edge_path, color="lime", linewidth=1)
     ax_contrast.set_title("Radial contrast (binary)")
+
+    ax_mask.imshow(img_rgb)
+    ax_mask.plot(ann["center_x"], ann["center_y"], "r+", markersize=12, markeredgewidth=2)
+    ax_mask.set_title(f"Mask overlay  —  area: {area:.0f} px²")
 
     plt.tight_layout()
     plt.show()

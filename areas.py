@@ -190,6 +190,62 @@ def viterbi(contrast: np.ndarray, r0: int, radius_step: float) -> np.ndarray:
     return path
 
 
+def compute_area(path: np.ndarray, radius_step: float, angle_step: float) -> float:
+    """Compute stem cross-sectional area in pixels² from the Viterbi path.
+
+    Uses the standard polar area formula: A = 0.5 * Σ r_i² * dθ,
+    where r_i = path[i] * radius_step is the radius in pixels at angle i.
+    """
+    radii_px = path * radius_step
+    return 0.5 * np.sum(radii_px ** 2) * angle_step
+
+
+def path_to_mask(
+    image_shape: tuple,
+    center_x: float,
+    center_y: float,
+    edge_x: float,
+    edge_y: float,
+    path: np.ndarray,
+    radius_step: float,
+    angle_step: float,
+) -> np.ndarray:
+    """Convert a Viterbi path in polar coordinates to a boolean mask in image space.
+
+    For each image pixel, its polar coordinates are computed relative to the stem
+    center, accounting for the cyclic rotation applied by rotate_to_edge. The pixel
+    is inside the mask if its radius is less than the path radius at its angle.
+
+    Returns a boolean array of shape image_shape.
+    """
+    h, w = image_shape
+    ys, xs = np.mgrid[:h, :w]
+    dx = xs.astype(float) - center_x
+    dy = ys.astype(float) - center_y
+
+    pixel_r     = np.sqrt(dx ** 2 + dy ** 2)
+    pixel_theta = np.arctan2(dy, dx) % (2 * np.pi)
+
+    # Subtract the edge-point angle to match the rotation in rotate_to_edge
+    edge_theta     = np.arctan2(edge_y - center_y, edge_x - center_x) % (2 * np.pi)
+    rotated_theta  = (pixel_theta - edge_theta) % (2 * np.pi)
+
+    angle_idx  = np.round(rotated_theta / angle_step).astype(int) % len(path)
+    path_r_px  = path[angle_idx] * radius_step          # path radius (px) at each pixel
+
+    return pixel_r < path_r_px
+
+
+def append_to_areas_csv(filename: str, area: float) -> None:
+    AREAS_CSV.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not AREAS_CSV.exists()
+    with open(AREAS_CSV, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=AREAS_CSV_COLUMNS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({"filename": filename, "area_px": round(area, 2)})
+
+
 def main():
     done_set    = load_done_set()
     annotations = load_annotations()
@@ -220,9 +276,11 @@ def main():
 
         r0 = int(np.round(r_annotated / radius_step))
         r0 = np.clip(r0, 0, polar.shape[1] - 1)
-        path = viterbi(contrast, r0, radius_step)
+        edge_path = viterbi(contrast, r0, radius_step)
 
-        # Steps 6–7 will extend here
+        area = compute_area(edge_path, radius_step, angle_step)
+        append_to_areas_csv(ann["filename"], area)
+        print(f"  Area: {area:.1f} px²  → saved")
 
 
 if __name__ == "__main__":
