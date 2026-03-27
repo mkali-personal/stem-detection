@@ -280,7 +280,7 @@ def main():
 
         area = compute_area(edge_path, radius_step, angle_step)
         append_to_areas_csv(ann["filename"], area)
-        print(f"  Area: {area:.1f} px²  → saved")
+        print(f"  Area: {area:.1f} px^2  saved")
 
 
 if __name__ == "__main__":
