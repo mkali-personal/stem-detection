@@ -14,9 +14,9 @@ CT scan stem cross-section area calculator. Input: `.tif` images of plant stem c
 3. Save coordinates + filename to `data/csv-outputs/annotations.csv` after each image (resumable)
 
 **Phase 2 — Area calculation (`data/csv-outputs/annotations.csv` → `data/csv-outputs/areas.csv`):**
-1. Load image, blur, create circular mask around the annotated center
+1. Load image, blur.
 2. Convert to polar coordinates (origin = stem center)
-3. Compute binary radial-contrast image (difference between adjacent radii, both signs)
+3. Compute binary contrast image, giving more weight to contrast in the radial direction (e.g. by applying a filter that emphasizes radial gradients)
 4. Rotate polar image so the clicked edge point is at θ=0
 5. Run Viterbi/HMM to trace the stem edge in polar coordinates:
    - States = possible radii; observations = binary contrast pixels

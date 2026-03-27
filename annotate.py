@@ -3,6 +3,8 @@ from pathlib import Path
 
 import numpy as np
 import tifffile
+from matplotlib import use
+use("TkAgg")  # Use TkAgg backend for interactive plotting
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter
 
