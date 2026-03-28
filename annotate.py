@@ -4,14 +4,14 @@ from pathlib import Path
 import numpy as np
 import tifffile
 from matplotlib import use
-use("TkAgg")  # Use TkAgg backend for interactive plotting
+use("TkAgg")
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter
 
-GAUSSIAN_SIGMA = 2
-RAW_IMAGES_DIR = Path(__file__).parent / "data/raw-images"
+GAUSSIAN_SIGMA  = 2
+RAW_IMAGES_DIR  = Path(__file__).parent / "data/raw-images"
 ANNOTATIONS_CSV = Path(__file__).parent / "data/csv-outputs/annotations.csv"
-CSV_COLUMNS = ["filename", "center_x", "center_y", "edge_x", "edge_y"]
+CSV_COLUMNS     = ["filename", "center_x", "center_y", "edge_x", "edge_y"]
 
 
 def load_done_set() -> set:
@@ -38,20 +38,6 @@ def load_and_blur(path: Path) -> np.ndarray:
     return gaussian_filter(arr.astype(float), sigma=GAUSSIAN_SIGMA)
 
 
-def collect_two_clicks(filename: str, blurred: np.ndarray):
-    plt.figure()
-    plt.imshow(blurred, cmap="gray")
-    plt.title(f"Image: {filename}\nClick 1: stem CENTER  |  Click 2: point on stem EDGE")
-    plt.tight_layout()
-    plt.show(block=False)
-    plt.pause(0.1)
-    clicks = plt.ginput(n=2, timeout=0)
-    plt.close()
-    if len(clicks) < 2:
-        return None
-    return clicks
-
-
 def append_to_csv(filename: str, center: tuple, edge: tuple):
     ANNOTATIONS_CSV.parent.mkdir(parents=True, exist_ok=True)
     write_header = not ANNOTATIONS_CSV.exists()
@@ -60,28 +46,110 @@ def append_to_csv(filename: str, center: tuple, edge: tuple):
         if write_header:
             writer.writeheader()
         writer.writerow({
-            "filename": filename,
-            "center_x": round(center[0], 2),
-            "center_y": round(center[1], 2),
-            "edge_x": round(edge[0], 2),
-            "edge_y": round(edge[1], 2),
+            "filename":  filename,
+            "center_x":  round(center[0], 2),
+            "center_y":  round(center[1], 2),
+            "edge_x":    round(edge[0], 2),
+            "edge_y":    round(edge[1], 2),
         })
+
+
+def delete_last_annotation() -> str | None:
+    """Remove the last row from the CSV and return its filename, or None if empty."""
+    if not ANNOTATIONS_CSV.exists():
+        return None
+    with open(ANNOTATIONS_CSV, newline="") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        return None
+    deleted = rows[-1]["filename"]
+    with open(ANNOTATIONS_CSV, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows[:-1])
+    return deleted
 
 
 def main():
     done_set = load_done_set()
-    pending = get_pending_images(done_set)
+    pending  = get_pending_images(done_set)
     if not pending:
         print("All images annotated.")
         return
     print(f"{len(pending)} to annotate, {len(done_set)} already done.")
-    for path in pending:
-        clicks = collect_two_clicks(path.name, load_and_blur(path))
-        if clicks is None:
+
+    fig, ax = plt.subplots()
+    plt.get_current_fig_manager().window.state("zoomed")
+
+    # Shared state touched by event callbacks
+    state = {"clicks": [], "action": None}
+
+    def on_click(event):
+        if event.inaxes != ax or event.button != 1:
+            return
+        if len(state["clicks"]) >= 2:
+            return
+        state["clicks"].append((event.xdata, event.ydata))
+        marker, color = ("r+", "red") if len(state["clicks"]) == 1 else ("bx", "blue")
+        ax.plot(event.xdata, event.ydata, marker, markersize=14, markeredgewidth=2,
+                color=color)
+        fig.canvas.draw()
+        if len(state["clicks"]) == 2:
+            state["action"] = "annotated"
+
+    def on_key(event):
+        if event.key == "backspace":
+            state["action"] = "backspace"
+        elif event.key == "escape":
+            state["action"] = "quit"
+
+    fig.canvas.mpl_connect("button_press_event", on_click)
+    fig.canvas.mpl_connect("key_press_event", on_key)
+
+    idx = 0
+    while idx < len(pending):
+        img_path = pending[idx]
+        ax.clear()
+        ax.imshow(load_and_blur(img_path), cmap="gray")
+        ax.set_title(
+            f"[{idx + 1}/{len(pending)}]  {img_path.name}\n"
+            "Click 1: CENTER    Click 2: EDGE    Backspace: undo    Esc: quit"
+        )
+        fig.canvas.draw()
+        fig.canvas.flush_events()
+
+        state["clicks"] = []
+        state["action"] = None
+
+        while state["action"] is None:
+            plt.pause(0.05)
+
+        if state["action"] == "quit":
             print("Session paused. Re-run to continue.")
             break
-        append_to_csv(path.name, clicks[0], clicks[1])
-        print(f"  Saved: {path.name}")
+
+        elif state["action"] == "backspace":
+            deleted = delete_last_annotation()
+            if deleted is None:
+                print("  Nothing to undo.")
+                state["action"] = None   # stay on current image
+            elif idx == 0:
+                # Undo from a previous session: prepend to pending list
+                pending.insert(0, RAW_IMAGES_DIR / deleted)
+                print(f"  Undone: {deleted}")
+                # idx stays 0, loop restarts showing the re-inserted image
+            else:
+                # Undo the annotation we just saved; step back one image
+                idx -= 1
+                print(f"  Undone: {deleted}")
+
+        elif state["action"] == "annotated":
+            center, edge = state["clicks"]
+            append_to_csv(img_path.name, center, edge)
+            print(f"  Saved: {img_path.name}")
+            idx += 1
+
+    plt.close()
 
 
 if __name__ == "__main__":

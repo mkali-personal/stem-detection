@@ -3,6 +3,8 @@ from pathlib import Path
 
 import numpy as np
 import tifffile
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
 from scipy.ndimage import gaussian_filter
 
 GAUSSIAN_SIGMA              = 1
@@ -15,6 +17,7 @@ CONTRAST_THRESHOLD_PCTILE   = 95   # percentile cutoff for binarisation
 RAW_IMAGES_DIR    = Path(__file__).parent / "data/raw-images"
 ANNOTATIONS_CSV   = Path(__file__).parent / "data/csv-outputs/annotations.csv"
 AREAS_CSV         = Path(__file__).parent / "data/csv-outputs/areas.csv"
+FIGURES_DIR       = Path(__file__).parent / "data/figures"
 AREAS_CSV_COLUMNS = ["filename", "area_px"]
 
 
@@ -236,6 +239,68 @@ def path_to_mask(
     return pixel_r < path_r_px
 
 
+def save_qc_figure(
+    filename: str,
+    blurred: np.ndarray,
+    ann: dict,
+    polar: np.ndarray,
+    contrast: np.ndarray,
+    edge_path: np.ndarray,
+    mask: np.ndarray,
+    r_annotated: float,
+    radius_step: float,
+    angle_step: float,
+    area: float,
+) -> None:
+    """Save a 4-panel QC figure to data/figures/<filename>.png."""
+    img_norm = (blurred - blurred.min()) / (blurred.max() - blurred.min())
+    img_rgb  = np.stack([img_norm] * 3, axis=-1)
+    tint     = np.array([0.0, 0.6, 0.6])
+    img_rgb[mask] = img_rgb[mask] * 0.65 + tint * 0.35
+
+    tick_angles = [0, 90, 180, 270]
+    tick_px     = [int(a / np.degrees(angle_step)) for a in tick_angles]
+    tick_labels = [str(a) for a in tick_angles]
+    angle_indices = np.arange(polar.shape[0])
+    r_line = r_annotated / radius_step
+
+    fig = Figure(figsize=(24, 5))
+    FigureCanvasAgg(fig)
+    ax_img, ax_polar, ax_contrast, ax_mask = fig.subplots(1, 4)
+
+    ax_img.imshow(blurred, cmap="gray")
+    ax_img.plot(ann["center_x"], ann["center_y"], "r+", markersize=12, markeredgewidth=2)
+    ax_img.plot(ann["edge_x"],   ann["edge_y"],   "bx", markersize=12, markeredgewidth=2)
+    ax_img.set_title(filename)
+
+    ax_polar.imshow(polar.T, cmap="gray", aspect="auto", origin="upper")
+    ax_polar.set_xlabel("angle (deg)")
+    ax_polar.set_ylabel("radius (px)")
+    ax_polar.set_xticks(tick_px)
+    ax_polar.set_xticklabels(tick_labels)
+    ax_polar.axhline(y=r_line, color="red", linestyle="--", linewidth=1)
+    ax_polar.plot(angle_indices, edge_path, color="lime", linewidth=1)
+    ax_polar.set_title("Polar transform")
+
+    ax_contrast.imshow(contrast.T, cmap="gray", aspect="auto", origin="upper")
+    ax_contrast.set_xlabel("angle (deg)")
+    ax_contrast.set_ylabel("radius (px)")
+    ax_contrast.set_xticks(tick_px)
+    ax_contrast.set_xticklabels(tick_labels)
+    ax_contrast.axhline(y=r_line, color="red", linestyle="--", linewidth=1)
+    ax_contrast.plot(angle_indices, edge_path, color="lime", linewidth=1)
+    ax_contrast.set_title("Radial contrast (binary)")
+
+    ax_mask.imshow(img_rgb)
+    ax_mask.plot(ann["center_x"], ann["center_y"], "r+", markersize=12, markeredgewidth=2)
+    ax_mask.set_title(f"Mask overlay  -  area: {area:.0f} px^2")
+
+    fig.tight_layout()
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = FIGURES_DIR / (Path(filename).stem + ".png")
+    fig.savefig(out_path, dpi=100)
+
+
 def append_to_areas_csv(filename: str, area: float) -> None:
     AREAS_CSV.parent.mkdir(parents=True, exist_ok=True)
     write_header = not AREAS_CSV.exists()
@@ -279,6 +344,14 @@ def main():
         edge_path = viterbi(contrast, r0, radius_step)
 
         area = compute_area(edge_path, radius_step, angle_step)
+        mask = path_to_mask(
+            blurred.shape, ann["center_x"], ann["center_y"],
+            ann["edge_x"], ann["edge_y"], edge_path, radius_step, angle_step,
+        )
+        save_qc_figure(
+            ann["filename"], blurred, ann, polar, contrast,
+            edge_path, mask, r_annotated, radius_step, angle_step, area,
+        )
         append_to_areas_csv(ann["filename"], area)
         print(f"  Area: {area:.1f} px^2  saved")
 
