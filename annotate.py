@@ -1,15 +1,19 @@
 import csv
+import os
 from pathlib import Path
 
 import numpy as np
 import tifffile
+from dotenv import load_dotenv
 from matplotlib import use
 use("TkAgg")
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter
 
+load_dotenv(Path(__file__).parent / ".env")
+
 GAUSSIAN_SIGMA  = 2
-RAW_IMAGES_DIR  = Path(__file__).parent / "data/raw-images"
+RAW_IMAGES_DIR  = Path(os.environ["RAW_IMAGES_DIR"])
 ANNOTATIONS_CSV = Path(__file__).parent / "data/csv-outputs/annotations.csv"
 CSV_COLUMNS     = ["filename", "center_x", "center_y", "edge_x", "edge_y"]
 

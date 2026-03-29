@@ -1,11 +1,15 @@
 import csv
+import os
 from pathlib import Path
 
 import numpy as np
 import tifffile
+from dotenv import load_dotenv
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from scipy.ndimage import gaussian_filter
+
+load_dotenv(Path(__file__).parent / ".env")
 
 GAUSSIAN_SIGMA              = 1
 TRANSITION_SIGMA            = 3    # HMM state transition spread (for later step)
@@ -14,7 +18,7 @@ NON_EDGE_EMISSION_PROB      = 0.5  # P(contrast pixel away from edge)
 CONTRAST_RADIAL_WEIGHT      = 3.0  # radial gradient weight relative to angular
 CONTRAST_THRESHOLD_PCTILE   = 95   # percentile cutoff for binarisation
 
-RAW_IMAGES_DIR    = Path(__file__).parent / "data/raw-images"
+RAW_IMAGES_DIR    = Path(os.environ["RAW_IMAGES_DIR"])
 ANNOTATIONS_CSV   = Path(__file__).parent / "data/csv-outputs/annotations.csv"
 AREAS_CSV         = Path(__file__).parent / "data/csv-outputs/areas.csv"
 FIGURES_DIR       = Path(__file__).parent / "data/figures"
