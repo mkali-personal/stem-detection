@@ -72,9 +72,22 @@ For each annotated image not yet processed, the script:
 4. Runs the Viterbi algorithm to trace the stem edge
 5. Computes the cross-sectional area (px²) from the traced contour
 6. Saves a 4-panel QC figure to `data/figures/<filename>.png`
-7. Appends the result to `data/csv-outputs/areas.csv`
+7. Writes the result to `data/csv-outputs/areas.csv` (updates existing row if present)
 
 Progress is printed to the console. Already-processed images are skipped, so the script is also resumable.
+
+Optional CLI arguments:
+
+- `--filename "<name>.tif"` processes one annotated image by exact filename.
+- `--force` recomputes even if that filename already exists in `areas.csv` (must be used with `--filename`).
+
+Examples:
+
+```bash
+python areas.py
+python areas.py --filename "10 - slice00659.tif"
+python areas.py --filename "10 - slice00659.tif" --force
+```
 
 ### Step 3 — Inspect results
 

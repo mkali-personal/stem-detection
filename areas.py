@@ -1,3 +1,4 @@
+import argparse
 import csv
 import os
 from pathlib import Path
@@ -11,7 +12,7 @@ from scipy.ndimage import gaussian_filter
 
 load_dotenv(Path(__file__).parent / ".env")
 
-GAUSSIAN_SIGMA              = 1
+GAUSSIAN_SIGMA              = 5
 TRANSITION_SIGMA            = 3    # HMM state transition spread (for later step)
 EDGE_EMISSION_PROB          = 0.9  # P(contrast pixel at true edge)
 NON_EDGE_EMISSION_PROB      = 0.5  # P(contrast pixel away from edge)
@@ -23,6 +24,22 @@ ANNOTATIONS_CSV   = Path(__file__).parent / "data/csv-outputs/annotations.csv"
 AREAS_CSV         = Path(__file__).parent / "data/csv-outputs/areas.csv"
 FIGURES_DIR       = Path(__file__).parent / "data/figures"
 AREAS_CSV_COLUMNS = ["filename", "area_px"]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Compute stem cross-sectional areas from annotations."
+    )
+    parser.add_argument(
+        "--filename",
+        help="Process only this annotated image filename (exact match).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Recompute even if filename already exists in areas.csv (use with --filename).",
+    )
+    return parser.parse_args()
 
 
 def load_done_set() -> set:
@@ -63,7 +80,10 @@ def load_and_blur(path: Path) -> np.ndarray:
     if arr.ndim == 3:
         print(f"  Warning: {path.name} is a 3D stack — using first slice only.")
         arr = arr[0]
-    return gaussian_filter(arr.astype(float), sigma=GAUSSIAN_SIGMA)
+    if GAUSSIAN_SIGMA is not None:
+        return gaussian_filter(arr.astype(float), sigma=GAUSSIAN_SIGMA)
+    else:
+        return arr.astype(float)
 
 
 def compute_radius(ann: dict) -> float:
@@ -305,59 +325,118 @@ def save_qc_figure(
     fig.savefig(out_path, dpi=100)
 
 
-def append_to_areas_csv(filename: str, area: float) -> None:
+def upsert_area_in_csv(filename: str, area: float) -> None:
     AREAS_CSV.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not AREAS_CSV.exists()
-    with open(AREAS_CSV, "a", newline="") as f:
+    area_value = str(round(area, 2))
+
+    rows = []
+    if AREAS_CSV.exists():
+        with open(AREAS_CSV, newline="") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames is None or "filename" not in reader.fieldnames:
+                raise ValueError(
+                    f"Malformed CSV at {AREAS_CSV}: expected header with 'filename'"
+                )
+            rows = list(reader)
+
+    replaced = False
+    for row in rows:
+        if row.get("filename") == filename:
+            row["area_px"] = area_value
+            replaced = True
+
+    if not replaced:
+        rows.append({"filename": filename, "area_px": area_value})
+
+    with open(AREAS_CSV, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=AREAS_CSV_COLUMNS)
-        if write_header:
-            writer.writeheader()
-        writer.writerow({"filename": filename, "area_px": round(area, 2)})
+        writer.writeheader()
+        writer.writerows(rows)
 
 
-def main():
+def process_annotation(ann: dict) -> dict:
+    path = RAW_IMAGES_DIR / ann["filename"]
+    print(f"  Processing: {ann['filename']}")
+    try:
+        blurred = load_and_blur(path)
+    except Exception as e:
+        print(f"  Skipping {ann['filename']}: {e}")
+        return {"filename": ann["filename"], "status": "skipped", "error": str(e)}
+
+    r_annotated = compute_radius(ann)
+
+    polar, angle_step, radius_step = to_polar(
+        blurred, ann["center_x"], ann["center_y"], r_annotated
+    )
+    polar = rotate_to_edge(polar, ann, angle_step)
+    contrast = compute_contrast(polar)
+
+    r0 = int(np.round(r_annotated / radius_step))
+    r0 = np.clip(r0, 0, polar.shape[1] - 1)
+    edge_path = viterbi(contrast, r0, radius_step)
+
+    area = compute_area(edge_path, radius_step, angle_step)
+    mask = path_to_mask(
+        blurred.shape, ann["center_x"], ann["center_y"],
+        ann["edge_x"], ann["edge_y"], edge_path, radius_step, angle_step,
+    )
+    save_qc_figure(
+        ann["filename"], blurred, ann, polar, contrast,
+        edge_path, mask, r_annotated, radius_step, angle_step, area,
+    )
+    upsert_area_in_csv(ann["filename"], area)
+    print(f"  Area: {area:.1f} px^2  saved")
+    return {
+        "filename": ann["filename"],
+        "status": "saved",
+        "area_px": float(round(area, 2)),
+    }
+
+
+def areas(filename: str = None, force: bool = False) -> list:
+    """Run area computation and return per-file statuses.
+
+    Args:
+        filename: Exact filename to process, or None to process all pending.
+        force: Recompute even if already present in areas.csv (only with filename).
+    """
+    if force and not filename:
+        print("--force can only be used together with --filename")
+        return []
+
     done_set    = load_done_set()
     annotations = load_annotations()
-    pending     = get_pending_annotations(annotations, done_set)
+
+    if filename:
+        requested = [ann for ann in annotations if ann["filename"] == filename]
+        if not requested:
+            print(f"No annotation found for filename: {filename}")
+            return []
+        if force:
+            pending = requested
+        else:
+            pending = [ann for ann in requested if ann["filename"] not in done_set]
+        if not pending and not force:
+            print(f"Area already computed for: {filename}")
+            return []
+    else:
+        pending = get_pending_annotations(annotations, done_set)
 
     if not pending:
         print("All annotated images have areas computed.")
-        return
+        return []
 
     print(f"{len(pending)} to process, {len(done_set)} already done.")
 
+    results = []
     for ann in pending:
-        path = RAW_IMAGES_DIR / ann["filename"]
-        print(f"  Processing: {ann['filename']}")
-        try:
-            blurred = load_and_blur(path)
-        except Exception as e:
-            print(f"  Skipping {ann['filename']}: {e}")
-            continue
+        results.append(process_annotation(ann))
+    return results
 
-        r_annotated = compute_radius(ann)
 
-        polar, angle_step, radius_step = to_polar(
-            blurred, ann["center_x"], ann["center_y"], r_annotated
-        )
-        polar = rotate_to_edge(polar, ann, angle_step)
-        contrast = compute_contrast(polar)
-
-        r0 = int(np.round(r_annotated / radius_step))
-        r0 = np.clip(r0, 0, polar.shape[1] - 1)
-        edge_path = viterbi(contrast, r0, radius_step)
-
-        area = compute_area(edge_path, radius_step, angle_step)
-        mask = path_to_mask(
-            blurred.shape, ann["center_x"], ann["center_y"],
-            ann["edge_x"], ann["edge_y"], edge_path, radius_step, angle_step,
-        )
-        save_qc_figure(
-            ann["filename"], blurred, ann, polar, contrast,
-            edge_path, mask, r_annotated, radius_step, angle_step, area,
-        )
-        append_to_areas_csv(ann["filename"], area)
-        print(f"  Area: {area:.1f} px^2  saved")
+def main():
+    args = parse_args()
+    areas(filename=args.filename, force=args.force)
 
 
 if __name__ == "__main__":
