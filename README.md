@@ -3,7 +3,7 @@
 CT scan stem cross-section area calculator. Input: `.tif` images of plant stem cross-sections on a roughly constant background. Output: stem cross-sectional area in pixels, saved to CSV.
 
 Example output (4-panel QC figure):
-![Example image](data/figures/11%20-%20slice00659.png)
+![Example image](data/figures/example_figure.png)
 
 The four panels show (left to right): the original image with the annotated center (+) and edge point (×); the polar transform with the annotated radius (red dashed) and Viterbi path (green); the binary radial-contrast image used by the HMM; and the final mask overlay with the computed area.
 

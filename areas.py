@@ -12,13 +12,6 @@ from scipy.ndimage import gaussian_filter
 
 load_dotenv(Path(__file__).parent / ".env")
 
-GAUSSIAN_SIGMA              = 5
-TRANSITION_SIGMA            = 3    # HMM state transition spread (for later step)
-EDGE_EMISSION_PROB          = 0.9  # P(contrast pixel at true edge)
-NON_EDGE_EMISSION_PROB      = 0.5  # P(contrast pixel away from edge)
-CONTRAST_RADIAL_WEIGHT      = 3.0  # radial gradient weight relative to angular
-CONTRAST_THRESHOLD_PCTILE   = 95   # percentile cutoff for binarisation
-
 RAW_IMAGES_DIR    = Path(os.environ["RAW_IMAGES_DIR"])
 ANNOTATIONS_CSV   = Path(__file__).parent / "data/csv-outputs/annotations.csv"
 AREAS_CSV         = Path(__file__).parent / "data/csv-outputs/areas.csv"
@@ -39,6 +32,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Recompute even if filename already exists in areas.csv (use with --filename).",
     )
+    parser.add_argument("--gaussian-sigma",            type=float, default=4,    metavar="N")
+    parser.add_argument("--transition-sigma",          type=float, default=2,    metavar="N")
+    parser.add_argument("--edge-emission-prob",        type=float, default=0.9,  metavar="P")
+    parser.add_argument("--non-edge-emission-prob",    type=float, default=0.5,  metavar="P")
+    parser.add_argument("--contrast-radial-weight",    type=float, default=1.0,  metavar="W")
+    parser.add_argument("--contrast-threshold-pctile", type=float, default=97,   metavar="N")
+    parser.add_argument("--radial-contrast-sign",      type=str,   default="||", choices=["+", "-", "||"])
     return parser.parse_args()
 
 
@@ -75,15 +75,18 @@ def get_pending_annotations(annotations: list, done_set: set) -> list:
     return [ann for ann in annotations if ann["filename"] not in done_set]
 
 
-def load_and_blur(path: Path) -> np.ndarray:
+def load_image(path: Path) -> np.ndarray:
     arr = tifffile.imread(path)
     if arr.ndim == 3:
         print(f"  Warning: {path.name} is a 3D stack — using first slice only.")
         arr = arr[0]
-    if GAUSSIAN_SIGMA is not None:
-        return gaussian_filter(arr.astype(float), sigma=GAUSSIAN_SIGMA)
-    else:
-        return arr.astype(float)
+    return arr.astype(float)
+
+
+def blur_image(image: np.ndarray, gaussian_sigma: float) -> np.ndarray:
+    if gaussian_sigma is not None:
+        return gaussian_filter(image, sigma=gaussian_sigma)
+    return image
 
 
 def compute_radius(ann: dict) -> float:
@@ -143,7 +146,12 @@ def rotate_to_edge(polar: np.ndarray, ann: dict, angle_step: float) -> np.ndarra
     return np.roll(polar, -shift, axis=0)
 
 
-def compute_contrast(polar: np.ndarray) -> np.ndarray:
+def compute_contrast(
+    polar: np.ndarray,
+    contrast_radial_weight: float,
+    contrast_threshold_pctile: float,
+    radial_contrast_sign: str,
+) -> np.ndarray:
     """Compute a binary contrast image from a polar-coordinate intensity array.
 
     Radial gradients (axis 1) are weighted more heavily than angular gradients
@@ -151,35 +159,58 @@ def compute_contrast(polar: np.ndarray) -> np.ndarray:
     produces a strong response.  Both positive and negative radial transitions
     (bright→dark and dark→bright) are captured via the absolute value.
 
+    radial_contrast_sign controls which radial transitions are emphasised:
+      '+'  — bright→dark outward (positive gradient)
+      '-'  — dark→bright outward (negative gradient, sign-flipped)
+      '||' — both directions (absolute value)
+
     Returns a binary array of the same shape as `polar`.
     """
-    grad_angle  = np.gradient(polar, axis=0)   # along angle axis
+    grad_angle  = np.gradient(polar, axis=0) / np.maximum(np.arange(polar.shape[1], dtype=float)[None, :], 1.0)  # angular grad normalized by r (ds = r dθ)
     grad_radius = np.gradient(polar, axis=1)   # along radius axis
 
-    weighted = CONTRAST_RADIAL_WEIGHT * np.abs(grad_radius) + np.abs(grad_angle)
-    weighted = np.maximum(weighted, 0.0)
+    if radial_contrast_sign == '+':
+        radial_term = grad_radius
+    elif radial_contrast_sign == '-':
+        radial_term = -grad_radius
+    elif radial_contrast_sign == '||':
+        radial_term = np.abs(grad_radius)
+    else:
+        raise ValueError(f"radial_contrast_sign must be '+', '-' or '||', got {radial_contrast_sign!r}")
 
-    threshold = np.percentile(weighted, CONTRAST_THRESHOLD_PCTILE)
+    weighted = contrast_radial_weight * radial_term + np.abs(grad_angle)
+
+    threshold = np.percentile(weighted, contrast_threshold_pctile)
     return (weighted > threshold).astype(float)
 
 
-def viterbi(contrast: np.ndarray, r0: int, radius_step: float) -> np.ndarray:
+def viterbi(
+    contrast: np.ndarray,
+    r0: int,
+    radius_step: float,
+    transition_sigma: float,
+    edge_emission_prob: float,
+    non_edge_emission_prob: float,
+) -> np.ndarray:
     """Trace the stem edge in polar coordinates using the Viterbi algorithm.
 
     States are radius indices. The path starts and ends at r0 (the annotated
     edge radius), enforcing a closed contour.
 
     Args:
-        contrast:    Binary contrast array, shape (n_angles, n_radii).
-        r0:          Initial (and forced final) radius state index.
-        radius_step: Pixel width of each radius bin, used to convert
-                     TRANSITION_SIGMA from pixels to bins.
+        contrast:              Binary contrast array, shape (n_angles, n_radii).
+        r0:                    Initial (and forced final) radius state index.
+        radius_step:           Pixel width of each radius bin, used to convert
+                               transition_sigma from pixels to bins.
+        transition_sigma:      HMM state transition spread in pixels.
+        edge_emission_prob:    P(contrast pixel at true edge).
+        non_edge_emission_prob: P(contrast pixel away from edge).
 
     Returns:
         path: int array of shape (n_angles,) — the radius index at each angle.
     """
     n_angles, n_radii = contrast.shape
-    sigma_bins = TRANSITION_SIGMA / radius_step
+    sigma_bins = transition_sigma / radius_step
 
     # Log transition matrix: log_trans[r, r'] = log P(r'|r) up to a constant.
     # Normaliser is the same for every r, so it doesn't affect argmax.
@@ -191,8 +222,8 @@ def viterbi(contrast: np.ndarray, r0: int, radius_step: float) -> np.ndarray:
     # Shape (n_angles, n_radii); positive where contrast=1, negative where contrast=0.
     log_emit = np.where(
         contrast > 0.5,
-        np.log(EDGE_EMISSION_PROB    / NON_EDGE_EMISSION_PROB),
-        np.log((1 - EDGE_EMISSION_PROB) / (1 - NON_EDGE_EMISSION_PROB)),
+        np.log(edge_emission_prob    / non_edge_emission_prob),
+        np.log((1 - edge_emission_prob) / (1 - non_edge_emission_prob)),
     )
 
     # Initialise: only r0 is a valid starting state.
@@ -265,9 +296,8 @@ def path_to_mask(
 
 def save_qc_figure(
     filename: str,
-    blurred: np.ndarray,
+    image: np.ndarray,
     ann: dict,
-    polar: np.ndarray,
     contrast: np.ndarray,
     edge_path: np.ndarray,
     mask: np.ndarray,
@@ -276,8 +306,15 @@ def save_qc_figure(
     angle_step: float,
     area: float,
 ) -> None:
-    """Save a 4-panel QC figure to data/figures/<filename>.png."""
-    img_norm = (blurred - blurred.min()) / (blurred.max() - blurred.min())
+    """Save a 4-panel QC figure to data/figures/<filename>.png.
+
+    Display panels use the original (unblurred) image; the contrast panel
+    reflects the blurred-derived computation used by Viterbi.
+    """
+    polar_orig, _, _ = to_polar(image, ann["center_x"], ann["center_y"], r_annotated)
+    polar_orig = rotate_to_edge(polar_orig, ann, angle_step)
+
+    img_norm = (image - image.min()) / (image.max() - image.min())
     img_rgb  = np.stack([img_norm] * 3, axis=-1)
     tint     = np.array([0.0, 0.6, 0.6])
     img_rgb[mask] = img_rgb[mask] * 0.65 + tint * 0.35
@@ -285,19 +322,19 @@ def save_qc_figure(
     tick_angles = [0, 90, 180, 270]
     tick_px     = [int(a / np.degrees(angle_step)) for a in tick_angles]
     tick_labels = [str(a) for a in tick_angles]
-    angle_indices = np.arange(polar.shape[0])
+    angle_indices = np.arange(polar_orig.shape[0])
     r_line = r_annotated / radius_step
 
     fig = Figure(figsize=(24, 5))
     FigureCanvasAgg(fig)
     ax_img, ax_polar, ax_contrast, ax_mask = fig.subplots(1, 4)
 
-    ax_img.imshow(blurred, cmap="gray")
+    ax_img.imshow(image, cmap="gray")
     ax_img.plot(ann["center_x"], ann["center_y"], "r+", markersize=12, markeredgewidth=2)
     ax_img.plot(ann["edge_x"],   ann["edge_y"],   "bx", markersize=12, markeredgewidth=2)
     ax_img.set_title(filename)
 
-    ax_polar.imshow(polar.T, cmap="gray", aspect="auto", origin="upper")
+    ax_polar.imshow(polar_orig.T, cmap="gray", aspect="auto", origin="upper")
     ax_polar.set_xlabel("angle (deg)")
     ax_polar.set_ylabel("radius (px)")
     ax_polar.set_xticks(tick_px)
@@ -354,34 +391,44 @@ def upsert_area_in_csv(filename: str, area: float) -> None:
         writer.writerows(rows)
 
 
-def process_annotation(ann: dict) -> dict:
+def process_annotation(
+    ann: dict,
+    gaussian_sigma: float,
+    transition_sigma: float,
+    edge_emission_prob: float,
+    non_edge_emission_prob: float,
+    contrast_radial_weight: float,
+    contrast_threshold_pctile: float,
+    radial_contrast_sign: str,
+) -> dict:
     path = RAW_IMAGES_DIR / ann["filename"]
     print(f"  Processing: {ann['filename']}")
     try:
-        blurred = load_and_blur(path)
+        image = load_image(path)
     except Exception as e:
         print(f"  Skipping {ann['filename']}: {e}")
         return {"filename": ann["filename"], "status": "skipped", "error": str(e)}
 
+    blurred = blur_image(image, gaussian_sigma)
     r_annotated = compute_radius(ann)
 
     polar, angle_step, radius_step = to_polar(
         blurred, ann["center_x"], ann["center_y"], r_annotated
     )
     polar = rotate_to_edge(polar, ann, angle_step)
-    contrast = compute_contrast(polar)
+    contrast = compute_contrast(polar, contrast_radial_weight, contrast_threshold_pctile, radial_contrast_sign)
 
     r0 = int(np.round(r_annotated / radius_step))
     r0 = np.clip(r0, 0, polar.shape[1] - 1)
-    edge_path = viterbi(contrast, r0, radius_step)
+    edge_path = viterbi(contrast, r0, radius_step, transition_sigma, edge_emission_prob, non_edge_emission_prob)
 
     area = compute_area(edge_path, radius_step, angle_step)
     mask = path_to_mask(
-        blurred.shape, ann["center_x"], ann["center_y"],
+        image.shape, ann["center_x"], ann["center_y"],
         ann["edge_x"], ann["edge_y"], edge_path, radius_step, angle_step,
     )
     save_qc_figure(
-        ann["filename"], blurred, ann, polar, contrast,
+        ann["filename"], image, ann, contrast,
         edge_path, mask, r_annotated, radius_step, angle_step, area,
     )
     upsert_area_in_csv(ann["filename"], area)
@@ -393,15 +440,32 @@ def process_annotation(ann: dict) -> dict:
     }
 
 
-def areas(filename: str = None, force: bool = False) -> list:
+def areas(
+    filename: str = None,
+    force: bool = False,
+    gaussian_sigma: float = 4,
+    transition_sigma: float = 2,
+    edge_emission_prob: float = 0.9,
+    non_edge_emission_prob: float = 0.5,
+    contrast_radial_weight: float = 1.0,
+    contrast_threshold_pctile: float = 97,
+    radial_contrast_sign: str = '||',
+) -> list:
     """Run area computation and return per-file statuses.
 
     Args:
-        filename: Exact filename to process, or None to process all pending.
-        force: Recompute even if already present in areas.csv (only with filename).
+        filename:                  Exact filename to process, or None to process all pending.
+        force:                     Recompute even if already present in areas.csv (only with filename).
+        gaussian_sigma:            Gaussian blur sigma applied before computation.
+        transition_sigma:          HMM state transition spread in pixels.
+        edge_emission_prob:        P(contrast pixel at true edge).
+        non_edge_emission_prob:    P(contrast pixel away from edge).
+        contrast_radial_weight:    Radial gradient weight relative to angular.
+        contrast_threshold_pctile: Percentile cutoff for contrast binarisation.
+        radial_contrast_sign:      Which radial transitions to emphasise: '+', '-' or '||'.
     """
     if force and not filename:
-        print("--force can only be used together with --filename")
+        print("force=True requires a filename to be specified.")
         return []
 
     done_set    = load_done_set()
@@ -430,13 +494,32 @@ def areas(filename: str = None, force: bool = False) -> list:
 
     results = []
     for ann in pending:
-        results.append(process_annotation(ann))
+        results.append(process_annotation(
+            ann,
+            gaussian_sigma=gaussian_sigma,
+            transition_sigma=transition_sigma,
+            edge_emission_prob=edge_emission_prob,
+            non_edge_emission_prob=non_edge_emission_prob,
+            contrast_radial_weight=contrast_radial_weight,
+            contrast_threshold_pctile=contrast_threshold_pctile,
+            radial_contrast_sign=radial_contrast_sign,
+        ))
     return results
 
 
 def main():
     args = parse_args()
-    areas(filename=args.filename, force=args.force)
+    areas(
+        filename=args.filename,
+        force=args.force,
+        gaussian_sigma=args.gaussian_sigma,
+        transition_sigma=args.transition_sigma,
+        edge_emission_prob=args.edge_emission_prob,
+        non_edge_emission_prob=args.non_edge_emission_prob,
+        contrast_radial_weight=args.contrast_radial_weight,
+        contrast_threshold_pctile=args.contrast_threshold_pctile,
+        radial_contrast_sign=args.radial_contrast_sign,
+    )
 
 
 if __name__ == "__main__":
